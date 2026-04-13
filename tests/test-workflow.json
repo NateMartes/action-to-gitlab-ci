@@ -1,0 +1,139 @@
+{
+  "name": "Terraform Apply Kafka",
+  "on": {
+    "workflow_call": {
+      "outputs": {
+        "vpc_id": {
+          "description": "The ID of the AWS VPC kafka was deployed to",
+          "value": "${{ jobs.init-kafka.outputs.vpc_id }}"
+        },
+        "route53_zone_id": {
+          "description": "The ID of the DNS hosted zone that kafka uses",
+          "value": "${{ jobs.init-kafka.outputs.route53_zone_id }}"
+        },
+        "route53_node_zone_id": {
+          "description": "The ID of the DNS hosted zone that kafka nodes uses",
+          "value": "${{ jobs.init-kafka.outputs.route53_node_zone_id }}"
+        },
+        "vpc_cidr": {
+          "description": "The CIDR block kafka uses",
+          "value": "${{ jobs.init-kafka.outputs.vpc_cidr }}"
+        },
+        "route_table_id": {
+          "description": "The ID of the route table that belongs to kafka nodes",
+          "value": "${{ jobs.init-kafka.outputs.route_table_id }}"
+        }
+      }
+    }
+  },
+  "jobs": {
+    "terraform-apply": {
+      "name": "Terraform Apply Kafka",
+      "runs-on": "ubuntu-latest",
+      "environment": "production",
+      "env": {
+        "TF_CLOUD_ORGANIZATION": "epa-terraform",
+        "TF_API_TOKEN": "${{ secrets.EPA_TF_API_TOKEN }}",
+        "TF_WORKSPACE": "terraform-github-actions-kafka",
+        "CONFIG_DIRECTORY": "./post_queue/terraform"
+      },
+      "permissions": {
+        "contents": "read"
+      },
+      "steps": [
+        {
+          "name": "Checkout",
+          "uses": "actions/checkout@v3"
+        },
+        {
+          "name": "Upload Configuration",
+          "uses": "hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0",
+          "id": "apply-upload",
+          "with": {
+            "workspace": "${{ env.TF_WORKSPACE }}",
+            "directory": "${{ env.CONFIG_DIRECTORY }}"
+          }
+        },
+        {
+          "name": "Create Apply Run",
+          "uses": "hashicorp/tfc-workflows-github/actions/create-run@v1.0.0",
+          "id": "apply-run",
+          "with": {
+            "workspace": "${{ env.TF_WORKSPACE }}",
+            "configuration_version": "${{ steps.apply-upload.outputs.configuration_version_id }}"
+          }
+        },
+        {
+          "name": "Apply",
+          "uses": "hashicorp/tfc-workflows-github/actions/apply-run@v1.0.0",
+          "if": "fromJSON(steps.apply-run.outputs.payload).data.attributes.actions.IsConfirmable",
+          "id": "apply",
+          "with": {
+            "run": "${{ steps.apply-run.outputs.run_id }}",
+            "comment": "Apply Run from GitHub Actions CI ${{ github.sha }}"
+          }
+        }
+      ]
+    },
+    "init-kafka": {
+      "needs": "terraform-apply",
+      "name": "Init Kafka",
+      "runs-on": "ubuntu-latest",
+      "environment": "production",
+      "outputs": {
+        "vpc_id": "${{ steps.init-kafka-cluster.outputs.vpc_id }}",
+        "route53_zone_id": "${{ steps.init-kafka-cluster.outputs.route53_zone_id }}",
+        "route53_node_zone_id": "${{ steps.init-kafka-cluster.outputs.route53_node_zone_id }}",
+        "vpc_cidr": "${{ steps.init-kafka-cluster.outputs.vpc_cidr }}",
+        "route_table_id": "${{ steps.init-kafka-cluster.outputs.route_table_id }}"
+      },
+      "env": {
+        "TF_CLOUD_ORGANIZATION": "epa-terraform",
+        "TF_API_TOKEN": "${{ secrets.EPA_TF_API_TOKEN }}",
+        "TF_WORKSPACE": "terraform-github-actions-kafka",
+        "CONFIG_DIRECTORY": "./post_queue/terraform",
+        "AWS_DEFAULT_REGION": "${{ vars.AWS_REGION }}"
+      },
+      "permissions": {
+        "contents": "read"
+      },
+      "steps": [
+        {
+          "name": "Checkout",
+          "uses": "actions/checkout@v3"
+        },
+        {
+          "name": "Setup Terraform CLI",
+          "uses": "hashicorp/setup-terraform@v3",
+          "with": {
+            "cli_config_credentials_token": "${{ secrets.EPA_TF_API_TOKEN }}"
+          }
+        },
+        {
+          "name": "Install AWS CLI",
+          "run": "sudo apt update && sudo apt install -y unzip curl\ncurl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"awscliv2.zip\"\nunzip awscliv2.zip\nsudo ./aws/install --update\nrm -rf awscliv2.zip aws\n"
+        },
+        {
+          "name": "Configure AWS CLI Credentials",
+          "uses": "aws-actions/configure-aws-credentials@v4",
+          "with": {
+            "aws-access-key-id": "${{ secrets.AWS_RUNNER_ACCESS_KEY }}",
+            "aws-secret-access-key": "${{ secrets.AWS_RUNNER_SECRET_KEY }}",
+            "aws-region": "${{ env.AWS_DEFAULT_REGION }}"
+          }
+        },
+        {
+          "name": "Init terraform CLI",
+          "working-directory": "${{ env.CONFIG_DIRECTORY }}",
+          "run": "terraform init"
+        },
+        {
+          "name": "Init the Kafka Cluster",
+          "working-directory": "${{ env.CONFIG_DIRECTORY }}",
+          "id": "init-kafka-cluster",
+          "run": "\n# Store output\necho \"vpc_id=$(terraform output -raw vpc_id)\" >> $GITHUB_OUTPUT\necho \"route53_zone_id=$(terraform output -raw kafka_dns_id)\" >> $GITHUB_OUTPUT\necho \"route53_node_zone_id=$(terraform output -raw kafka_node_dns_id)\" >> $GITHUB_OUTPUT\necho \"vpc_cidr=$(terraform output -raw vpc_cidr_block)\" >> $GITHUB_OUTPUT\necho \"route_table_id=$(terraform output -raw route_table_id)\" >> $GITHUB_OUTPUT\n\n# For ECS Exec\nsudo apt install -y expect\n\n# Get variables for ecs command\ncluster_name=$(terraform output -raw kafka_cluster_name)\nservice_name=$(terraform output -raw first_kafka_service)\n\n# Move to ./post_queue\ncd ../\n\n# Get script files (encode in Base64 for special characters)\nSCRIPT_B64=$(base64 -w 0 ./init.sh)\n\nsuccess=0\nfor i in $(seq 1 10); do\n  echo \"Trying to connect to Kafka cluster instances (Attempt $i/10)...\"\n  \n  # Get Task ARN for one of the nodes in the cluster\n  task_arn=$(aws ecs list-tasks \\\n    --cluster \"$cluster_name\" \\\n    --service-name \"$service_name\" \\\n    --desired-status RUNNING \\\n    --query 'taskArns[0]' --output text)\n    \n  echo \"Target Task ARN: $task_arn\"\n\n  if [ \"$task_arn\" == \"None\" ] || [ -z \"$task_arn\" ]; then\n    echo \"No RUNNING task found yet. Retrying in 10 seconds...\"\n    sleep 10\n    continue\n  fi\n\n  echo \"Running Init Script...\"\n  EXEC_OUTPUT=$(unbuffer aws ecs execute-command \\\n      --cluster \"$cluster_name\" \\\n      --task \"$task_arn\" \\\n      --container \"kafka\" \\\n      --interactive \\\n      --command \"sh -c '\n      \n        # Move needed files over\n        echo $SCRIPT_B64 | base64 -d > /tmp/init.sh\n        chmod +x /tmp/init.sh\n        \n        # Run\n        /tmp/init.sh --is-started\n        \n        # Finish\n        echo SUCCESS_TOKEN: Kafka initialized\n        '\" 2>&1) || true\n  \n  echo \"$EXEC_OUTPUT\"\n\n  # Validate the actual container output\n  if echo \"$EXEC_OUTPUT\" | grep -q \"SUCCESS_TOKEN\"; then\n    echo \"Kafka initialize successfully\"\n    success=1\n    break\n  elif echo \"$EXEC_OUTPUT\"; then\n    echo \"Connection failed or SSM tunnel not ready. Retrying in 10 seconds...\"\n    sleep 10\n  fi\ndone\n\nif [ $success -ne 1 ]; then\n  echo \"Failed to initialize cluster in 10 tries with ECS command, exiting\"\n  exit 1\nfi\n"
+        }
+      ]
+    }
+  }
+}
